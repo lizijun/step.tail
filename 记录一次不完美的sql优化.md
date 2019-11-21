@@ -1,4 +1,4 @@
-最近，实施反馈有条sql执行很慢。由于篇幅过长和对公司隐私的保护，我对sql的查询字段进行了精简，表名也马赛克了一下。
+    最近，实施反馈有条sql执行很慢。由于篇幅过长和对公司隐私的保护，我对sql的查询字段进行了精简，表名也马赛克了一下。
 ``` sql
 SELECT
 	T1.UUID AS uuid,
@@ -90,15 +90,15 @@ SQL> select count(*) from TEST_MASAIKE_RISKTYPE;
 
 - 第一个子查询T1会分页查出25条数据，所以第一个子查询效率应该不会太差。
 
-- 通过T1的uuid查询T2中的数据。
+- 通过T1的uuid索引查询T2中的数据。
 
-- 通过T1的uuid查询T3中的数据。
+- 通过T1的uuid索引查询T3中的数据。
 
   
-
+#### 第一步，建索引
 **首先看了下表中的索引，发现TEST_MASAIKE_RISKTYPE的uuid未建索引，开发给出的理由是TEST_MASAIKE_RISKTYPE和TEST_MASAIKE是多对一的关系，可能存在uuid相同的情况，重复数据可能比较多。但是，理论上不重复的数据只要超过50%，我认为都可以建索引。**
 
-**加上索引后，获取了执行计划（这里需要说明获取执行计划是根据sqlId执行dbms_xplan.display_cursor函数获取的,因为display函数获取的执行计划不是真实执行的，是根据oracle的统计信息生成的。）**
+**加上索引后，重新获取了执行计划（这里需要说明获取执行计划是根据sqlId执行dbms_xplan.display_cursor函数获取的,因为display函数获取的执行计划不是真实执行的，是根据oracle的统计信息生成的。）**
 ```
 select * from table(dbms_xplan.display_cursor(sql_id,null)); 
 
@@ -141,16 +141,28 @@ Predicate Information (identified by operation id):
               23:59:59')
 ```
 
-通过执行计划可以看出，三个子查询分别通过时间索引查询，其中第二个子查询会group by得到结果后，然后和T1进行hash join，hash join的结果会和第三个子查询group by得到结果进行hash join，这个执行计划和我们想象的显然不一样。
-
-
-
-看到这个执行计划，我先是疑惑为什么加的uuid索引没什么鸟用。
+通过执行计划可以看出，三个子查询分别通过时间索引查询，其中第二个子查询会group by得到结果后，和T1进行hash join，hash join的结果会和第三个子查询group by得到结果再次hash join，这个执行计划和我们想象的显然不一样，事实也证明，查询效率依然没有改善。
+虽然三个子查询均走了时间索引，但是由于该时间范围内的数据比较大（原因是造的测试数据比较集中），索引效果很差。
+看到这个执行计划，我先是疑惑为什么加的uuid索引没什么鸟用，于是我想先看看索引是否生效。
 
 ```·sql
-select * from TEST_MASAIKE_RISKTYPE where uuid = '';
+-- 先通过一条简单的sql先看下索引是否生效
+select * from TEST_MASAIKE_RISKTYPE where uuid = '5ed10315a5bd424ab639dd0ada837cbf';
+
+ Plan Hash Value  : 3608587963 
+
+----------------------------------------------------------------------------------
+| Id  | Operation           | Name              | Rows | Bytes | Cost | Time     |
+----------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |                   |    1 |   131 | 4958 | 00:01:00 |
+| * 1 |   TABLE ACCESS FULL | TEST_MASAIKE |    1 |   131 | 4958 | 00:01:00 |
+----------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+------------------------------------------
+* 1 - filter("UUID"='5ed10315a5bd424ab639dd0ada837cbf')
 ```
-通过改sql的查询计划发现也未走索引，想到应该是统计信息不正确，导致未走索引。通过执行
+通过该sql的查询计划发现也未走索引，想到应该是统计信息不准确，导致未走索引。通过执行
 DBMS_STATS.GATHER_TABLE_STATS(ownname VARCHAR2, tabname VARCHAR2)，重新统计信息，然后发现索引生效，此时再看之前sql的执行计划。
 
 ```
@@ -187,7 +199,63 @@ Predicate Information (identified by operation id):
 ```
 
 这个执行计划，走了几个全表扫描，最后还是hash join， 执行耗时也非常大。即使把时间范围缩小，仍然只是走时间索引。
-其实可以看出第二个和第三个子查询比较耗时，于是我想是不是能把聚合函数往外提，不要在子查询中group by。 通过改写，能够将sql的耗时降到3秒。
+
+#### 第二步，改写sql
+其实可以从执行计划中看出第二个和第三个子查询比较耗时，于是我想是不是能把聚合函数往外提，不要在子查询中group by。 通过改写，能够将sql的耗时降到3秒。
+具体的方式，是将第二个和第三个子查询去除，直接关联表查询，这样可以避免先执行子查询的消耗。
+```
+SELECT
+  UUID AS uuid,
+  WM_CONCAT ( RULECODE ) AS ruleCode,
+  WM_CONCAT ( RISKTYPE ) AS riskType,
+  ID AS id 
+FROM
+  (
+  SELECT
+    T1.UUID AS uuid,
+    T3.RULE_CODE AS ruleCode,
+    T2.RISK_TYPE AS riskType,
+    T1.ID AS id 
+  FROM
+    (
+    SELECT
+      * 
+    FROM
+      (
+      SELECT
+        row_.*,
+        ROWNUM rownum_ 
+      FROM
+        (
+        SELECT
+          ID,
+          UUID 
+        FROM
+          TEST_MASAIKE 
+        WHERE
+          OPER_USER = 'admin' 
+          AND STATUS = '0' 
+          AND TRANS_TIME >= to_date( '2019-11-09 00:00:00', 'YYYY-MM-DD 
+          HH24:MI:SS' ) 
+          AND TRANS_TIME <= to_date( '2019-11-15 23:59:59', 'YYYY-MM-DD HH24:MI:SS' ) 
+        ORDER BY
+          TRANS_TIME DESC 
+        ) row_ 
+      ) 
+    WHERE
+      rownum_ > 0 
+      AND rownum_ <= 0 + 25 
+    ) T1
+    LEFT JOIN TEST_MASAIKE_RISKTYPE T2 ON T1.UUID = T2.UUID
+    LEFT JOIN TEST_MASAIKE_RISKS T3 ON T1.UUID = T3.UUID 
+  ORDER BY
+    T2.TRANS_TIME DESC 
+  ) G 
+GROUP BY
+  G.UUID,
+  G.id
+  ```
+改写后的执行计划如下：
 ```
  Plan Hash Value  : 1078327277 
 
@@ -220,9 +288,10 @@ Predicate Information (identified by operation id):
 * 12 - filter("from$_subquery$_003"."UUID"="T3"."UUID"(+))
 ```
 
-从执行计划来看，依旧有几个全表扫描，而且之前的hash join消除了，但是出现了merge join，而且同样有几个全表扫描，于是还是放弃了这个优化方式。实际上，按照我们之前预想的方式，使用nest loop关联才是最佳的。
-可是优化器为什么没有采用nest loop， 网上看到说由于子查询不是物理表，所以可能统计信息并不准确，导致优化器无法产生我们预想的执行计划。这个说的通，但是有待验证。
-既然优化器不使用nest loop，我们就自己指定nest loop，oracle有一种hint的方式，可以调整执行计划。
+从执行计划来看，依旧有几个全表扫描，而且之前的hash join消除了，但是出现了merge join。另外，有个开发告诉我，有些查询条件是TEST_MASAIKE_RISKTYPE和TEST_MASAIKE_RISKS表字段，这就意味着我们简单的用这种方式改写，这种改写很容易导致与需求不一致。于是还是放弃了这个优化方式，实际上，我认为按照我们之前预想的方式，使用nested loops关联才是最佳的。
+#### 第二步优化失败，尝试第三步优化
+优化器为什么没有采用nested loops， 网上看到说由于子查询不是物理表，所以可能统计信息并不准确，导致优化器无法产生我们预想的执行计划。这个说的通，但是有待验证。
+既然优化器不使用nested loops，我们就自己指定nested loops，oracle有一种hint的方式，可以调整执行计划。
 我们这里使用use_nl。
 
 ```
@@ -332,6 +401,7 @@ Predicate Information (identified by operation id):
 ```
 
 我们可以看出连接方式终于变成了nested loops，而且TEST_MASAIKE_RISKS和TEST_MASAIKE_RISKTYPE都走了索引查询。
-这时再看看查询耗时在2秒左右。现在sql的耗时，通过执行计划可以看出主要应该在于TEST_MASAIKE的全表扫描，主要是因为数据比较集中，所以未走索引。
+这时再看看查询耗时在2秒左右。通过执行计划可以看出优化后的主要耗时应该在于TEST_MASAIKE的全表扫描，这里是因为数据比较集中，所以未走索引。
 
 由于水平实在有限，加上没有太多时间去优化，只能暂时以加hint的方式来优化。加hint其实有很多缺点，它改变了执行计划，意味着优化器不再根据统计信息进行自动优化，在不同的环境或者随着数据量的改变很有可能降低执行效率。
+如果有更好的解决方式，希望大家不吝赐教。
